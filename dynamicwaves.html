@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ciudad 3D · Infinita + Ondas Morfables</title>
+  <style>
+    :root{
+      --bg1:#071233; --bg2:#0b1e4a; --bg3:#091935;
+    }
+    html,body{margin:0;height:100%;overflow:hidden;background:linear-gradient(180deg,var(--bg1),var(--bg2) 60%,var(--bg3));}
+    canvas{display:block}
+    .hud{position:fixed;left:12px;bottom:12px;padding:8px 10px;border-radius:12px;background:rgba(6,10,20,.45);backdrop-filter:blur(6px);font:12px ui-monospace,monospace;color:#d8ecff;letter-spacing:.2px;}
+    .hud b{color:#8fe3ff}
+  </style>
+</head>
+<body>
+<div class="hud">Rueda = velocidad rotación • Click izq = pausar/seguir • <b>Ondas:</b> 1→2→3→1 (morph)</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+<script>
+// ===================== CONFIG =====================
+const CFG = {
+  tile: 1.7,           // tamaño base de cada bloque (x,z)
+  gap:  0.65,          // separación
+  minH: 0.35,          // altura mínima
+  maxH: 10.5,          // altura máxima
+  grid: 160,           // N x N instancias visibles (usa InstancedMesh)
+  ease: 5.0,           // rapidez de ajuste hacia el target
+  cycleSec: 12,        // segundos por transición completa (1→2, 2→3, 3→1)
+  idleSec: 1.5,        // respiro entre transiciones
+  autorotate: 0.12,    // rad/seg de giro de cámara (eje Y)
+  hazeColor: 0x0e1a38,
+  baseColor: 0xdce9ff,
+  tone: "modern"       // marcador por si quieres experimentar
+};
+
+// ===================== ESCENA =====================
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(CFG.hazeColor, 0.012);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
+const camRadius = 70;           // radio de la órbita
+const camHeight = 26;           // altura fija de la cámara
+let camAngle = Math.PI/4;       // ángulo inicial
+camera.position.set(Math.sin(camAngle)*camRadius, camHeight, Math.cos(camAngle)*camRadius);
+camera.lookAt(0,0,0);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+// Luces modernas: hemisferio + direccional suave
+scene.add(new THREE.HemisphereLight(0x8fd1ff, 0x15223d, 0.7));
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(40, 60, -20);
+scene.add(sun);
+
+// ===================== GEOMETRÍA (InstancedMesh) =====================
+const step = CFG.tile + CFG.gap;
+const HALF = Math.floor(CFG.grid/2);
+const COUNT = CFG.grid * CFG.grid;
+const boxGeo = new THREE.BoxGeometry(CFG.tile, 1, CFG.tile);
+
+// Material con gradiente moderno dependiente de altura (sin recomputar colores por instancia)
+const cityMat = new THREE.MeshStandardMaterial({color:CFG.baseColor, roughness:0.35, metalness:0.08});
+cityMat.onBeforeCompile = (shader)=>{
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <common>',
+    `#include <common>\n varying float vWorldY;`
+  ).replace(
+    '#include <project_vertex>',
+    `#include <project_vertex>\n vWorldY = (modelMatrix * vec4( transformed, 1.0 )).y;`
+  );
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <common>',
+    `#include <common>\n varying float vWorldY;\n vec3 palette(float t){\n   // paleta cyan→azul→violeta en espacio lineal
+   vec3 c1=vec3(0.60,0.93,1.00); // cian
+   vec3 c2=vec3(0.33,0.53,1.00); // azul
+   vec3 c3=vec3(0.86,0.56,1.00); // violeta
+   vec3 mix1 = mix(c1,c2,smoothstep(0.0,0.6,t));
+   return mix(mix1,c3,smoothstep(0.5,1.0,t));
+ }`
+  ).replace(
+    'vec4 diffuseColor = vec4( diffuse, opacity );',
+    `float hNorm = clamp((vWorldY - ${CFG.minH.toFixed(2)}) / ${ (CFG.maxH-CFG.minH).toFixed(2) }, 0.0, 1.0);\n vec3 grad = palette(hNorm);\n vec4 diffuseColor = vec4( grad, opacity );`
+  );
+};
+
+const mesh = new THREE.InstancedMesh(boxGeo, cityMat, COUNT);
+mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(mesh);
+
+// ===================== ONDAS (CAMPOS DE ALTURA) =====================
+function wave1(x,z,t){ // radial respirando
+  const r = Math.hypot(x,z);
+  return 0.5 + 0.45*Math.sin(r*0.35 - t*1.2) + 0.15*Math.sin(r*0.1 + t*0.5);
+}
+function wave2(x,z,t){ // rejilla senoidal 2D cruzada
+  return 0.5 + 0.35*Math.sin(x*0.55 + t*1.1) * Math.sin(z*0.45 - t*0.9);
+}
+function wave3(x,z,t){ // rombos (taxicab) propagando
+  const d = Math.abs(x)+Math.abs(z);
+  return 0.5 + 0.42*Math.sin(d*0.38 - t*1.4);
+}
+const WAVES = [wave1, wave2, wave3];
+let waveIdx = 0, nextIdx = 1;
+let phase = 0; // 0→1 de morph entre ondas
+let holdTimer = CFG.idleSec; // pausa inicial
+
+// ===================== ESTADO POR INSTANCIA =====================
+const H = new Float32Array(COUNT);      // altura actual
+const T = new Float32Array(COUNT);      // target
+const TMP = new THREE.Object3D();       // para setMatrixAt
+
+function baseHeight(){ return CFG.minH; }
+
+// Inicializar grilla centrada en (0,0)
+let n=0;
+for(let zi=-HALF; zi<=HALF; zi++){
+  for(let xi=-HALF; xi<=HALF; xi++){
+    const x = xi*step, z = zi*step;
+    const h = baseHeight();
+    TMP.position.set(x, h/2, z);
+    TMP.scale.set(1, h, 1);
+    TMP.updateMatrix();
+    mesh.setMatrixAt(n, TMP.matrix);
+    H[n] = h; T[n] = h; n++;
+  }
+}
+mesh.instanceMatrix.needsUpdate = true;
+
+// Cálculo de targets según morph de ondas
+function computeTargets(t){
+  const wA = WAVES[waveIdx], wB = WAVES[nextIdx];
+  let idx = 0;
+  for(let zi=-HALF; zi<=HALF; zi++){
+    for(let xi=-HALF; xi<=HALF; xi++){
+      const x = xi*0.6, z = zi*0.6; // escala para las ondas
+      const a = wA(x,z,t), b = wB(x,z,t);
+      const norm = a*(1-phase) + b*phase; // morph continuo
+      T[idx++] = THREE.MathUtils.clamp( THREE.MathUtils.mapLinear(norm, 0, 1, CFG.minH, CFG.maxH), CFG.minH, CFG.maxH );
+    }
+  }
+}
+
+// ===================== INTERACCIÓN =====================
+let rotating = true;
+addEventListener('click', ()=> rotating = !rotating);
+addEventListener('wheel', (e)=>{ CFG.autorotate = Math.max(0, CFG.autorotate + (e.deltaY>0?-0.02:0.02)); });
+
+// ===================== BUCLE =====================
+let t0 = performance.now()/1000;
+function animate(){
+  const t = performance.now()/1000; const dt = Math.min(0.033, t - t0); t0 = t;
+
+  // Gestionar morph de ondas
+  if(holdTimer>0){ holdTimer -= dt; if(holdTimer<=0) phase = 0; }
+  else{
+    phase += dt / CFG.cycleSec;
+    if(phase>=1){
+      // Siguiente par de ondas
+      waveIdx = nextIdx; nextIdx = (nextIdx+1)%WAVES.length; phase = 0; holdTimer = CFG.idleSec;
+    }
+  }
+
+  computeTargets(t*0.8); // recalcular objetivos de altura
+
+  // Easing de cada instancia hacia su objetivo
+  let idx=0; n=0;
+  for(let zi=-HALF; zi<=HALF; zi++){
+    for(let xi=-HALF; xi<=HALF; xi++){
+      const x = xi*step, z = zi*step;
+      const h = H[idx];
+      const target = T[idx];
+      const diff = target - h;
+      const stepH = (CFG.ease * (0.18 + Math.abs(diff)/(CFG.maxH-CFG.minH))) * dt;
+      const nh = Math.abs(diff) <= stepH ? target : h + Math.sign(diff)*stepH;
+      H[idx] = nh;
+
+      TMP.position.set(x, nh/2, z);
+      TMP.scale.set(1, nh, 1);
+      TMP.updateMatrix();
+      mesh.setMatrixAt(idx, TMP.matrix);
+      idx++;
+    }
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+
+  // Rotación de cámara alrededor del eje Y (sin desplazamientos laterales arbitrarios)
+  if(rotating) camAngle += CFG.autorotate * dt;
+  camera.position.set(Math.sin(camAngle)*camRadius, camHeight, Math.cos(camAngle)*camRadius);
+  camera.lookAt(0,0,0);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// ===================== RESIZE =====================
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
