@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Ciudad 3D</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0b0b10; }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+
+<script>
+const CONFIG = {
+  grid: 20,
+  spacing: 3,
+  base: 2,
+  minH: 0.5,
+  maxH: 15,
+  color: 0xdfe6eb,
+  red: 0xe05252,
+  green: 0x58d68d
+};
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0b10);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+camera.position.set(40,30,40);
+camera.lookAt(0,0,0);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const light = new THREE.DirectionalLight(0xffffff,1);
+light.position.set(20,50,20);
+scene.add(light);
+scene.add(new THREE.AmbientLight(0x999999));
+
+const buildings = [];
+const half = CONFIG.grid/2;
+const baseMat = new THREE.MeshStandardMaterial({color:CONFIG.color});
+
+for(let i=0;i<CONFIG.grid;i++){
+  for(let j=0;j<CONFIG.grid;j++){
+    const geo = new THREE.BoxGeometry(CONFIG.base,1,CONFIG.base);
+    const mesh = new THREE.Mesh(geo, baseMat.clone());
+    const h = THREE.MathUtils.randFloat(CONFIG.minH,CONFIG.maxH/2);
+    mesh.scale.y = h;
+    mesh.position.set((i-half)*CONFIG.spacing, h/2, (j-half)*CONFIG.spacing);
+    mesh.userData = {h:h, target:h, state:"idle"};
+    scene.add(mesh);
+    buildings.push(mesh);
+  }
+}
+
+function pick(){
+  const b = buildings[Math.floor(Math.random()*buildings.length)];
+  if(b.userData.state!=="idle") return;
+  if(Math.random()<0.5){
+    // bajar
+    b.userData.target = Math.max(CONFIG.minH, b.userData.h - THREE.MathUtils.randFloat(1,4));
+    b.userData.state="down";
+    b.material.color.setHex(CONFIG.red);
+  }else{
+    // subir
+    b.userData.target = Math.min(CONFIG.maxH, b.userData.h + THREE.MathUtils.randFloat(1,4));
+    b.userData.state="up";
+    b.material.color.setHex(CONFIG.green);
+  }
+}
+setInterval(pick,700);
+
+function animate(){
+  requestAnimationFrame(animate);
+  for(const m of buildings){
+    if(m.userData.state==="idle") continue;
+    const dir = m.userData.state==="up"?1:-1;
+    m.userData.h += dir*0.05*(Math.abs(m.userData.target-m.userData.h)+0.2);
+    if((dir>0 && m.userData.h>=m.userData.target) || (dir<0 && m.userData.h<=m.userData.target)){
+      m.userData.h = m.userData.target;
+      m.userData.state="idle";
+      m.material.color.setHex(CONFIG.color);
+    }
+    m.scale.y = m.userData.h;
+    m.position.y = m.userData.h/2;
+  }
+  renderer.render(scene,camera);
+}
+animate();
+
+addEventListener("resize",()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
