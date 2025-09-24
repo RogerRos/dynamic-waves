@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ciudad 3D · Transiciones rojo/verde por lotes</title>
+  <style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#ffffff;}
+    canvas{display:block}
+    .hud{
+      position:fixed;left:12px;bottom:12px;padding:8px 10px;border-radius:12px;
+      background:rgba(240,244,255,.8);backdrop-filter:blur(6px);
+      font:12px ui-monospace,monospace;color:#0b1e4a;letter-spacing:.2px;
+      border:1px solid rgba(7,18,51,.08)
+    }
+    .hud b{color:#0b1e4a}
+  </style>
+</head>
+<body>
+<div class="hud">
+  Rueda = velocidad rotación • Click izq = pausar/seguir •
+  <b>Ondas:</b> 1→2→3→1 (lotes aleatorios; <span style="color:#18a558">verde=sube</span>, <span style="color:#d32f2f">rojo=baja</span>)
+</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+<script>
+// ===================== CONFIG =====================
+const CFG = {
+  tile: 1.7,            // base de cada bloque (x,z)
+  gap:  0.65,           // separación
+  minH: 0.35,           // altura mínima
+  maxH: 10.5,           // altura máxima
+  grid: 160,            // N x N (usa InstancedMesh)
+  domainScale: 0.6,     // escala de coordenadas para las ondas
+  // Transiciones por lotes (pocas y lentas)
+  speed: 0.65,          // velocidad de cambio (unidades de altura por segundo)
+  spawnPerSec: 140,     // cuántas nuevas activaciones por segundo
+  maxConcurrent: 900,   // activas simultáneamente como máximo
+  // Cámara
+  camRadius: 105,       // radio de órbita
+  camHeight: 85,        // altura
+  camTarget: new THREE.Vector3(6,0,0), // leve desplazamiento del centro
+  autorotate: 0.045,    // rad/seg de giro (lento)
+  // Colores
+  hazeColor: 0xf0f4ff,
+  baseColor: 0xdce9ff,
+  riseRGB: [0.20, 0.90, 0.30], // verde (lineal 0..1)
+  dropRGB: [0.96, 0.20, 0.18]  // rojo  (lineal 0..1)
+};
+
+// ===================== ESCENA =====================
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(CFG.hazeColor, 0.006);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 3000);
+let camAngle = Math.PI*0.15; // leve inclinación orbital
+function placeCamera(){
+  const x = Math.sin(camAngle)*CFG.camRadius + CFG.camTarget.x;
+  const z = Math.cos(camAngle)*CFG.camRadius + CFG.camTarget.z;
+  camera.position.set(x, CFG.camHeight, z);
+  camera.lookAt(CFG.camTarget);
+}
+placeCamera();
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setClearColor(0xffffff, 1);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+// Iluminación para fondo blanco
+scene.add(new THREE.HemisphereLight(0xffffff, 0xdfe6f3, 0.85));
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(60, 120, -40);
+scene.add(sun);
+
+// ===================== GEOMETRÍA (InstancedMesh) =====================
+const step = CFG.tile + CFG.gap;
+const COUNT = CFG.grid * CFG.grid;
+const boxGeo = new THREE.BoxGeometry(CFG.tile, 1, CFG.tile);
+
+// Material con gradiente por altura + override por instancia (rojo/verde durante cambio)
+const cityMat = new THREE.MeshStandardMaterial({color:CFG.baseColor, roughness:0.30, metalness:0.06});
+cityMat.onBeforeCompile = (shader)=>{
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <common>',
+    `#include <common>
+     attribute float overrideFlag;   // 0 = normal, 1 = override
+     attribute vec3  ovColor;        // color a inyectar (rojo/verde)
+     varying float vOverride;
+     varying vec3  vOvColor;
+     varying float vWorldY;`
+  ).replace(
+    '#include <project_vertex>',
+    `#include <project_vertex>
+     vWorldY = (modelMatrix * vec4( transformed, 1.0 )).y;
+     vOverride = overrideFlag;
+     vOvColor   = ovColor;`
+  );
+
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <common>',
+    `#include <common>
+     varying float vOverride;
+     varying vec3  vOvColor;
+     varying float vWorldY;
+     vec3 palette(float t){
+       // paleta suave cyan→azul→violeta en espacio lineal
+       vec3 c1=vec3(0.64,0.81,1.00);
+       vec3 c2=vec3(0.42,0.56,1.00);
+       vec3 c3=vec3(0.84,0.74,1.00);
+       vec3 mix1 = mix(c1,c2,smoothstep(0.0,0.6,t));
+       return mix(mix1,c3,smoothstep(0.5,1.0,t));
+     }`
+  ).replace(
+    'vec4 diffuseColor = vec4( diffuse, opacity );',
+    `float hNorm = clamp((vWorldY - ${CFG.minH.toFixed(2)}) / ${(CFG.maxH-CFG.minH).toFixed(2)}, 0.0, 1.0);
+     vec3 grad = palette(hNorm);
+     vec3 finalCol = mix(grad, vOvColor, vOverride); // si override=1 => rojo/verde sólido
+     vec4 diffuseColor = vec4(finalCol, opacity);`
+  );
+};
+
+// InstancedMesh + atributos por instancia
+const mesh = new THREE.InstancedMesh(boxGeo, cityMat, COUNT);
+mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(mesh);
+
+// Atributos instanciados para override de color
+const overrideAttr = new THREE.InstancedBufferAttribute(new Float32Array(COUNT), 1);
+const ovColorAttr  = new THREE.InstancedBufferAttribute(new Float32Array(COUNT*3), 3);
+mesh.geometry.setAttribute('overrideFlag', overrideAttr);
+mesh.geometry.setAttribute('ovColor', ovColorAttr);
+
+// ===================== ONDAS (CAMPOS DE ALTURA, SIN TIEMPO) =====================
+function wave1(x,z){ // radial
+  const r = Math.hypot(x,z);
+  return 0.5 + 0.45*Math.sin(r*0.35) + 0.15*Math.sin(r*0.10);
+}
+function wave2(x,z){ // rejilla 2D
+  return 0.5 + 0.35*Math.sin(x*0.55) * Math.sin(z*0.45);
+}
+function wave3(x,z){ // rombos (taxicab)
+  const d = Math.abs(x)+Math.abs(z);
+  return 0.5 + 0.42*Math.sin(d*0.38);
+}
+const WAVES = [wave1, wave2, wave3];
+let currentWave = 0, nextWave = 1;
+
+// ===================== ESTADO POR INSTANCIA =====================
+// Coordenadas precomputadas (mundo y dominio)
+const posX = new Float32Array(COUNT);
+const posZ = new Float32Array(COUNT);
+const domX = new Float32Array(COUNT);
+const domZ = new Float32Array(COUNT);
+
+const offset = (CFG.grid - 1) / 2;
+let k=0;
+for(let zi=0; zi<CFG.grid; zi++){
+  for(let xi=0; xi<CFG.grid; xi++){
+    const dx = (xi - offset), dz = (zi - offset);
+    posX[k] = dx*step;
+    posZ[k] = dz*step;
+    domX[k] = dx*CFG.domainScale;
+    domZ[k] = dz*CFG.domainScale;
+    k++;
+  }
+}
+
+const H       = new Float32Array(COUNT); // altura actual
+const Target  = new Float32Array(COUNT); // objetivo de la transición en curso
+const Active  = new Uint8Array(COUNT);   // 1 si está cambiando
+const Done    = new Uint8Array(COUNT);   // 1 si ya llegó al objetivo
+const activeList = new Int32Array(COUNT);
+let activeLen = 0, activeCount = 0, doneCount = 0;
+
+const TMP = new THREE.Object3D(); // para setMatrixAt
+function setInstance(i, h){
+  TMP.position.set(posX[i], h/2, posZ[i]);
+  TMP.scale.set(1, h, 1);
+  TMP.updateMatrix();
+  mesh.setMatrixAt(i, TMP.matrix);
+}
+
+// Helpers override color por instancia
+function setOverride(i, flag, rgb){
+  overrideAttr.setX(i, flag?1:0);
+  if(flag){
+    ovColorAttr.setXYZ(i, rgb[0], rgb[1], rgb[2]);
+  }
+}
+
+// Inicializar en Onda 1
+(function initWave1(){
+  const w = WAVES[currentWave];
+  for(let i=0;i<COUNT;i++){
+    const norm = w(domX[i], domZ[i]);
+    const h = THREE.MathUtils.mapLinear(norm, 0, 1, CFG.minH, CFG.maxH);
+    H[i] = h;
+    setInstance(i, h);
+    setOverride(i, 0); // color normal
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  overrideAttr.needsUpdate = true; ovColorAttr.needsUpdate = true;
+})();
+
+// Preparar transición a la siguiente onda
+function prepareTransition(toWaveIdx){
+  const w = WAVES[toWaveIdx];
+  activeLen = 0; activeCount = 0; doneCount = 0;
+  Active.fill(0); Done.fill(0);
+  for(let i=0;i<COUNT;i++){
+    const norm = w(domX[i], domZ[i]);
+    const t = THREE.MathUtils.clamp(THREE.MathUtils.mapLinear(norm, 0, 1, CFG.minH, CFG.maxH), CFG.minH, CFG.maxH);
+    Target[i] = t;
+    // Si ya está en el objetivo (casi), marcar Done
+    if(Math.abs(t - H[i]) < 1e-3){ Done[i]=1; doneCount++; }
+  }
+}
+prepareTransition(nextWave);
+
+// ===================== INTERACCIÓN =====================
+let rotating = true;
+addEventListener('click', ()=> rotating = !rotating);
+addEventListener('wheel', (e)=>{
+  CFG.autorotate = Math.max(0, CFG.autorotate + (e.deltaY>0?-0.01:0.01));
+});
+
+// ===================== BUCLE =====================
+let t0 = performance.now()/1000;
+let spawnAcc = 0;
+function animate(){
+  const t = performance.now()/1000; const dt = Math.min(0.033, t - t0); t0 = t;
+
+  // Cámara (rotación lenta en torno al target)
+  if(rotating) camAngle += CFG.autorotate * dt;
+  placeCamera();
+
+  // Spawning de nuevas instancias activas (por lotes pequeños, aleatorios)
+  spawnAcc += CFG.spawnPerSec * dt;
+  let budget = Math.floor(spawnAcc);
+  if(budget>0){ spawnAcc -= budget; }
+  if(activeCount < CFG.maxConcurrent){
+    const canAdd = Math.min(budget, CFG.maxConcurrent - activeCount);
+    let attempts = 0, added = 0;
+    while(added < canAdd && attempts < canAdd*12){
+      const i = (Math.random()*COUNT)|0;
+      if(!Active[i] && !Done[i]){
+        const diff = Target[i] - H[i];
+        if(Math.abs(diff) < 1e-3){
+          Done[i]=1; doneCount++;
+        }else{
+          Active[i]=1;
+          activeList[activeLen++] = i;
+          activeCount++;
+          setOverride(i, 1, diff>0 ? CFG.riseRGB : CFG.dropRGB); // verde si sube, rojo si baja
+        }
+        added++;
+      }
+      attempts++;
+    }
+    if(added>0){ overrideAttr.needsUpdate = true; ovColorAttr.needsUpdate = true; }
+  }
+
+  // Avance de las activas (lentas)
+  let anyMatrixChange = false;
+  for(let idx=0; idx<activeLen; idx++){
+    const i = activeList[idx];
+    const diff = Target[i] - H[i];
+    const stepH = CFG.speed * dt;
+    if(Math.abs(diff) <= stepH){
+      // Llegó: fijar, volver a color normal, desactivar
+      H[i] = Target[i];
+      setInstance(i, H[i]);
+      anyMatrixChange = true;
+      setOverride(i, 0);
+      overrideAttr.needsUpdate = true;
+      Active[i]=0; Done[i]=1; doneCount++;
+      // quitar de activeList por swap con el último
+      activeList[idx] = activeList[--activeLen];
+      idx--; activeCount--;
+    }else{
+      H[i] += Math.sign(diff) * stepH;
+      setInstance(i, H[i]);
+      anyMatrixChange = true;
+    }
+  }
+  if(anyMatrixChange) mesh.instanceMatrix.needsUpdate = true;
+
+  // Si todos llegaron, iniciar siguiente onda inmediatamente
+  if(doneCount >= COUNT){
+    currentWave = nextWave;
+    nextWave = (nextWave + 1) % WAVES.length;
+    prepareTransition(nextWave);
+  }
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// ===================== RESIZE =====================
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
